@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NAGP temporary AMI builder. Launches a single short-lived EC2 instance in a public
+  subnet, installs the application runtime from the private S3 artifact, and configures
+  a Gunicorn systemd service. A WaitCondition makes stack completion depend on a
+  successful bootstrap. No AMI is created here (that is a controlled post-stack step).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Inputs }
+        Parameters: [FoundationStackName, BaseAmiId, AppArtifactKey]
+
+Parameters:
+  FoundationStackName:
+    Type: String
+    Description: Name of the deployed foundation stack (for cross-stack imports).
+  BaseAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Amazon Linux 2023 x86_64 AMI id (resolve from the public SSM parameter).
+  AppArtifactKey:
+    Type: String
+    Default: artifacts/app/app.zip
+    Description: S3 key of the application artifact within the project bucket.
+
+Resources:
+  BuilderWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  BuilderWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: BuilderInstance
+    Properties:
+      Handle: !Ref BuilderWaitHandle
+      Timeout: '1200'
+      Count: 1
+
+  BuilderInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref BaseAmiId
+      InstanceType: t3.micro
+      CreditSpecification: { CPUCredits: standard }
+      IamInstanceProfile:
+        Fn::ImportValue: !Sub '${FoundationStackName}-BuilderInstanceProfileName'
+      SubnetId:
+        Fn::ImportValue: !Sub '${FoundationStackName}-PublicSubnetAId'
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub '${FoundationStackName}-BuilderSecurityGroupId'
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 8, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags:
+        - { Key: Name, Value: nagp-ami-builder }
+        - { Key: Project, Value: nagp }
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            # Phase-aware bootstrap. On any error the WaitCondition receives a FAILURE
+            # naming the phase (no commands/URLs/credentials/secrets are ever sent).
+            set -euo pipefail
+            HANDLE="${WaitHandle}"
+            PHASE="initialization"
+            signal() { curl -sS -X PUT -H 'Content-Type:' \
+              --data "{\"Status\":\"$1\",\"Reason\":\"$2\",\"UniqueId\":\"nagp-builder\",\"Data\":\"$3\"}" \
+              "$HANDLE" || true; }
+            trap 'rc=$?; signal FAILURE "Builder bootstrap failed during $PHASE (exit $rc)" "$PHASE"' ERR
+
+            PHASE="verify-aws-cli"
+            echo "[builder] $PHASE"
+            command -v aws
+            aws --version
+
+            PHASE="install-python-runtime"
+            echo "[builder] $PHASE"
+            # Application runtime = Python 3.11 (pinned deps require >= 3.10). The AL2023
+            # system interpreter (/usr/bin/python3, 3.9) is left untouched.
+            dnf -y install python3.11 python3.11-pip
+
+            PHASE="verify-python-runtime"
+            echo "[builder] $PHASE"
+            python3.11 --version
+            python3.11 --version | grep -q "Python 3.11"
+
+            PHASE="prepare-directory"
+            echo "[builder] $PHASE"
+            install -d /opt/nagp-app
+
+            PHASE="download-artifact"
+            echo "[builder] $PHASE"
+            aws s3 cp "s3://${Bucket}/${AppArtifactKey}" /tmp/app.zip
+
+            PHASE="extract-artifact"
+            echo "[builder] $PHASE"
+            # Python standard library extraction — no external archive tool needed.
+            python3.11 -m zipfile -e /tmp/app.zip /opt/nagp-app/
+
+            PHASE="create-venv"
+            echo "[builder] $PHASE"
+            python3.11 -m venv /opt/nagp-app/venv
+            # Fail the bootstrap if the venv is not Python 3.11.
+            /opt/nagp-app/venv/bin/python --version | grep -q "Python 3.11"
+
+            PHASE="install-dependencies"
+            echo "[builder] $PHASE"
+            /opt/nagp-app/venv/bin/python -m pip install -r /opt/nagp-app/requirements.txt
+
+            PHASE="write-service"
+            echo "[builder] $PHASE"
+            cat >/etc/systemd/system/nagp-app.service <<'UNIT'
+            [Unit]
+            Description=NAGP document upload web app
+            After=network.target
+            [Service]
+            WorkingDirectory=/opt/nagp-app
+            EnvironmentFile=-/etc/nagp-app.env
+            ExecStart=/opt/nagp-app/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:8000 app:app
+            Restart=on-failure
+            User=root
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable nagp-app.service
+
+            PHASE="start-service"
+            echo "[builder] $PHASE"
+            # Start once to prove the app is runnable. /health needs no runtime config;
+            # the launch template supplies the runtime env file on the final instances.
+            systemctl start nagp-app.service
+
+            PHASE="health-check"
+            echo "[builder] $PHASE"
+            for _ in $(seq 1 15); do
+              if curl -fsS http://127.0.0.1:8000/health >/dev/null; then break; fi
+              sleep 2
+            done
+            systemctl is-active --quiet nagp-app.service
+            curl -fsS http://127.0.0.1:8000/health >/dev/null
+
+            PHASE="complete"
+            signal SUCCESS "Builder bootstrap complete" "complete"
+          - Bucket:
+              Fn::ImportValue: !Sub '${FoundationStackName}-ArtifactBucketName'
+            WaitHandle: !Ref BuilderWaitHandle
+
+Outputs:
+  BuilderInstanceId:
+    Description: Instance id to snapshot into a custom AMI, then terminate.
+    Value: !Ref BuilderInstance

@@ -1,0 +1,12 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Build output
+.build/
+dist/
+*.zip
+# Local env
+.env
+*.log

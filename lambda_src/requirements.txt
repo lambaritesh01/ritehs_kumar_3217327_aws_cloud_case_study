@@ -1,0 +1,4 @@
+# Lambda deployment-zip dependencies.
+# boto3/botocore are provided by the managed Lambda runtime and are NOT bundled.
+# Exact pin = the version tested locally in the project .venv.
+PyMySQL==1.2.3

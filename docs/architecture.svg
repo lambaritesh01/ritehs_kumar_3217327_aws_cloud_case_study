@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1520 980" font-family="Segoe UI, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#334"/>
+    </marker>
+    <marker id="arrowdash" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#88a"/>
+    </marker>
+  </defs>
+
+  <style>
+    .box{fill:#fff;stroke:#4a6;stroke-width:1.5;rx:8;}
+    .tier{fill:#f7fbff;stroke:#bcd;stroke-width:1;}
+    .svc{fill:#fffdf5;stroke:#c9a24b;stroke-width:1.5;}
+    .net{fill:#eef6ee;stroke:#4a6;stroke-width:1.5;}
+    .buildtime{fill:#eef;stroke:#88a;stroke-width:1.5;stroke-dasharray:5 4;}
+    .notdep{fill:#f4f4f4;stroke:#999;stroke-width:1.5;stroke-dasharray:6 4;}
+    .lbl{fill:#223;}
+    .sub{fill:#556;font-size:11px;}
+    .flow{stroke:#334;stroke-width:1.6;fill:none;}
+    .build{stroke:#88a;stroke-width:1.4;fill:none;stroke-dasharray:5 4;}
+    .nodb{stroke:#c33;stroke-width:1.6;fill:none;stroke-dasharray:4 3;}
+    .elbl{fill:#334;font-size:11px;}
+    .title{fill:#111;font-size:20px;font-weight:bold;}
+  </style>
+
+  <text x="30" y="34" class="title">NAGP AWS — Insurance Document-Upload MVP (us-east-1)</text>
+
+  <!-- AWS + VPC containers -->
+  <rect x="150" y="55" width="1350" height="820" rx="10" fill="#fbfbfd" stroke="#345" stroke-width="1.5"/>
+  <text x="165" y="76" class="sub">AWS Cloud — us-east-1</text>
+  <rect x="250" y="90" width="1010" height="770" rx="10" class="net" fill="none"/>
+  <text x="264" y="110" class="sub">VPC 10.20.0.0/16 — 2 Availability Zones</text>
+
+  <!-- Tier bands -->
+  <rect x="270" y="125" width="430" height="120" rx="8" class="tier"/>
+  <text x="284" y="143" class="sub">Public subnets (A 10.20.0.0/24 · B 10.20.1.0/24)</text>
+  <rect x="270" y="270" width="700" height="330" rx="8" class="tier"/>
+  <text x="284" y="288" class="sub">Private app subnets (A 10.20.10.0/24 · B 10.20.11.0/24)</text>
+  <rect x="270" y="630" width="700" height="120" rx="8" class="tier"/>
+  <text x="284" y="648" class="sub">Private DB subnets (A 10.20.20.0/24 · B 10.20.21.0/24)</text>
+
+  <!-- User + IGW -->
+  <rect x="20" y="150" width="110" height="60" rx="8" class="box"/>
+  <text x="35" y="185" class="lbl">User / Browser</text>
+  <rect x="160" y="150" width="80" height="60" rx="8" class="net"/>
+  <text x="176" y="178" class="lbl">Internet</text><text x="182" y="196" class="lbl">Gateway</text>
+
+  <!-- ALB (public) -->
+  <rect x="300" y="155" width="180" height="60" rx="8" class="box"/>
+  <text x="315" y="180" class="lbl">Application Load</text><text x="315" y="198" class="lbl">Balancer — HTTP :80</text>
+
+  <!-- Builder (public, build-time) -->
+  <rect x="500" y="155" width="185" height="70" rx="8" class="buildtime"/>
+  <text x="512" y="178" class="lbl">Temp AMI builder</text>
+  <text x="512" y="195" class="sub">t3.micro · Public A · no SSH</text>
+  <text x="512" y="211" class="sub">build-time only, terminated</text>
+
+  <!-- EC2 ASG (app) -->
+  <rect x="290" y="300" width="230" height="90" rx="8" class="box"/>
+  <text x="303" y="323" class="lbl">EC2 Auto Scaling Group</text>
+  <text x="303" y="341" class="sub">2x t3.micro · Gunicorn/Flask :8000</text>
+  <text x="303" y="357" class="sub">AZ a + AZ b · private, no public IP</text>
+  <text x="303" y="373" class="sub">min 2 / desired 2 / max 4</text>
+
+  <!-- Lambda (app) -->
+  <rect x="290" y="430" width="230" height="80" rx="8" class="box"/>
+  <text x="303" y="453" class="lbl">Lambda (VPC)</text>
+  <text x="303" y="471" class="sub">python3.14 · PyMySQL</text>
+  <text x="303" y="487" class="sub">S3 event + read_recent</text>
+
+  <!-- Endpoints (app) -->
+  <rect x="560" y="300" width="380" height="55" rx="8" class="svc"/>
+  <text x="573" y="323" class="lbl">S3 Gateway Endpoint</text>
+  <text x="573" y="342" class="sub">private S3 access (route-based)</text>
+  <rect x="560" y="370" width="185" height="55" rx="8" class="svc"/>
+  <text x="572" y="392" class="lbl">Secrets Mgr</text><text x="572" y="410" class="sub">Interface EP</text>
+  <rect x="755" y="370" width="185" height="55" rx="8" class="svc"/>
+  <text x="767" y="392" class="lbl">CloudWatch Logs</text><text x="767" y="410" class="sub">Interface EP</text>
+
+  <!-- RDS (db) -->
+  <rect x="290" y="655" width="360" height="75" rx="8" class="box"/>
+  <text x="303" y="678" class="lbl">RDS MySQL 8.0 — db.t3.micro</text>
+  <text x="303" y="696" class="sub">Single-AZ · private · encrypted · RDS-managed password</text>
+  <text x="303" y="712" class="sub">DB subnet group spans A + B (Multi-AZ-ready)</text>
+
+  <!-- NAT not deployed -->
+  <rect x="710" y="655" width="250" height="75" rx="8" class="notdep"/>
+  <text x="722" y="682" class="lbl">NAT Gateway</text>
+  <text x="722" y="700" class="sub">NOT DEPLOYED</text>
+  <text x="722" y="716" class="sub">production option, omitted for cost</text>
+
+  <!-- Regional services (right) -->
+  <rect x="1290" y="130" width="200" height="90" rx="8" class="svc"/>
+  <text x="1303" y="153" class="lbl">Private S3 bucket</text>
+  <text x="1303" y="171" class="sub">artifacts/app/</text>
+  <text x="1303" y="187" class="sub">artifacts/lambda/</text>
+  <text x="1303" y="203" class="sub">uploads/ (only trigger)</text>
+  <rect x="1290" y="360" width="200" height="60" rx="8" class="svc"/>
+  <text x="1303" y="385" class="lbl">Secrets Manager</text>
+  <text x="1303" y="403" class="sub">RDS-managed credentials</text>
+  <rect x="1290" y="470" width="200" height="70" rx="8" class="svc"/>
+  <text x="1303" y="493" class="lbl">CloudWatch</text>
+  <text x="1303" y="511" class="sub">dashboard + 6 alarms</text>
+
+  <!-- Flows (solid) -->
+  <path class="flow" d="M130,180 L158,180" marker-end="url(#arrow)"/>
+  <path class="flow" d="M240,180 L298,182" marker-end="url(#arrow)"/>
+  <text x="245" y="172" class="elbl">HTTP :80</text>
+  <path class="flow" d="M390,215 L400,300" marker-end="url(#arrow)"/>
+  <text x="404" y="270" class="elbl">SG :8000</text>
+  <!-- EC2 -> S3 GW -> S3 -->
+  <path class="flow" d="M520,335 L558,332" marker-end="url(#arrow)"/>
+  <path class="flow" d="M940,320 L1288,175" marker-end="url(#arrow)"/>
+  <text x="1010" y="250" class="elbl">PutObject uploads/</text>
+  <!-- S3 -> Lambda -->
+  <path class="flow" d="M1290,200 L950,455 L522,468" marker-end="url(#arrow)"/>
+  <text x="980" y="440" class="elbl">ObjectCreated (uploads/ only)</text>
+  <!-- Lambda -> endpoints -->
+  <path class="flow" d="M520,455 L560,400" marker-end="url(#arrow)"/>
+  <path class="flow" d="M520,470 L754,405" marker-end="url(#arrow)"/>
+  <!-- endpoints -> services -->
+  <path class="flow" d="M745,392 L1288,388" marker-end="url(#arrow)"/>
+  <text x="980" y="382" class="elbl">GetSecretValue</text>
+  <path class="flow" d="M940,410 L1288,500" marker-end="url(#arrow)"/>
+  <text x="1010" y="470" class="elbl">logs</text>
+  <!-- Lambda -> RDS -->
+  <path class="flow" d="M400,510 L410,653" marker-end="url(#arrow)"/>
+  <text x="414" y="600" class="elbl">MySQL :3306 (Lambda SG only)</text>
+  <!-- EC2 NO DB -->
+  <path class="nodb" d="M300,388 C230,500 230,560 300,660"/>
+  <text x="150" y="530" fill="#c33" font-size="11">EC2 has NO</text>
+  <text x="150" y="545" fill="#c33" font-size="11">DB connection</text>
+
+  <!-- Build-time (dashed) -->
+  <path class="build" d="M685,190 L1290,160" marker-end="url(#arrowdash)"/>
+  <text x="980" y="150" class="elbl" fill="#88a">read artifacts/app/</text>
+  <path class="build" d="M560,220 L470,300" marker-end="url(#arrowdash)"/>
+  <text x="470" y="265" class="elbl" fill="#88a">create AMI, terminate</text>
+  <!-- conceptual NAT -->
+  <path class="build" d="M520,470 C620,560 660,600 760,655" marker-end="url(#arrowdash)"/>
+  <text x="600" y="600" class="elbl" fill="#88a">conceptual outbound</text>
+
+  <!-- Legend -->
+  <rect x="1030" y="770" width="460" height="95" rx="8" fill="#fff" stroke="#ccc"/>
+  <text x="1045" y="790" class="lbl" font-weight="bold">Legend</text>
+  <line x1="1045" y1="808" x2="1085" y2="808" class="flow" marker-end="url(#arrow)"/>
+  <text x="1095" y="812" class="sub">solid = deployed runtime path</text>
+  <line x1="1045" y1="830" x2="1085" y2="830" class="build" marker-end="url(#arrowdash)"/>
+  <text x="1095" y="834" class="sub">dashed = build-time / conceptual / not deployed</text>
+  <line x1="1045" y1="852" x2="1085" y2="852" class="nodb"/>
+  <text x="1095" y="856" class="sub">red = blocked path (EC2 cannot reach the database)</text>
+</svg>

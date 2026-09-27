@@ -1,0 +1,64 @@
+%% NAGP AWS insurance document-upload MVP — architecture
+%% Legend: solid = deployed runtime path; dashed = build-time / conceptual / not deployed
+flowchart LR
+  user([User / Browser])
+
+  subgraph AWS["AWS us-east-1"]
+    igw[Internet Gateway]
+
+    subgraph VPC["VPC 10.20.0.0/16"]
+      subgraph PUB["Public subnets (A 10.20.0.0/24 / B 10.20.1.0/24)"]
+        alb{{"Application Load Balancer — HTTP :80"}}
+        builder["Temporary AMI builder (Public A)\nt3.micro, no SSH — build-time only"]
+      end
+
+      subgraph APP["Private app subnets (A 10.20.10.0/24 / B 10.20.11.0/24)"]
+        ec2a["EC2 t3.micro — Gunicorn/Flask :8000 (AZ a)"]
+        ec2b["EC2 t3.micro — Gunicorn/Flask :8000 (AZ b)"]
+        lam["Lambda (VPC) — python3.14, PyMySQL"]
+        s3gw[["S3 Gateway Endpoint"]]
+        smep[["Secrets Manager Interface Endpoint"]]
+        logsep[["CloudWatch Logs Interface Endpoint"]]
+      end
+
+      subgraph DB["Private DB subnets (A 10.20.20.0/24 / B 10.20.21.0/24)"]
+        rds[("RDS MySQL 8.0 — db.t3.micro, Single-AZ, private, encrypted")]
+      end
+
+      nat["NAT Gateway — NOT DEPLOYED (production option, omitted for cost)"]
+    end
+
+    s3[("Private S3 bucket\nartifacts/app/ · artifacts/lambda/ · uploads/")]
+    sm[["Secrets Manager (RDS-managed credentials)"]]
+    cw["CloudWatch — dashboard + 6 alarms"]
+  end
+
+  %% Runtime request path (solid)
+  user -->|HTTP :80| igw --> alb
+  alb -->|SG :8000| ec2a
+  alb -->|SG :8000| ec2b
+  ec2a -->|PutObject uploads/| s3gw --> s3
+  ec2b -->|PutObject uploads/| s3gw
+  s3 -->|ObjectCreated uploads/ only| lam
+  lam -->|HeadObject/GetObject| s3gw
+  lam -->|GetSecretValue| smep --> sm
+  lam -->|MySQL :3306 (SG: Lambda only)| rds
+  lam -->|logs| logsep --> cw
+  ec2a -->|logs| logsep
+
+  %% EC2 has NO database path
+  ec2a -. "NO DB connection" .-x rds
+
+  %% Build-time path (dashed)
+  builder -. "read artifacts/app/" .-> s3
+  builder -. "create AMI, then terminate" .-> ec2a
+
+  %% Conceptual (dashed)
+  app_note -. conceptual outbound .-> nat
+
+  app_note["Private tiers: no NAT; AWS access via endpoints"]
+
+  classDef notdeployed stroke-dasharray:6 4,fill:#f4f4f4,color:#666,stroke:#999;
+  classDef buildtime stroke-dasharray:4 3,fill:#eef,color:#334,stroke:#88a;
+  class nat notdeployed;
+  class builder buildtime;

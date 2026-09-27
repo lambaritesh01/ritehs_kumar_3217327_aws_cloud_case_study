@@ -1,0 +1,426 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NAGP application stack: Single-AZ RDS MySQL (RDS-managed credentials), the VPC-attached
+  document-processor Lambda, an internet-facing ALB, an Auto Scaling Group of private
+  app instances with target-tracking, and CloudWatch dashboard + alarms. Imports network
+  and IAM/profile values from the foundation stack.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Inputs }
+        Parameters: [FoundationStackName, AppAmiId, LambdaArtifactKey]
+      - Label: { default: Database }
+        Parameters: [DbEngineVersion, DatabaseName]
+      - Label: { default: Project }
+        Parameters: [ProjectName]
+
+Parameters:
+  FoundationStackName:
+    Type: String
+    Description: Name of the deployed foundation stack (for cross-stack imports).
+  AppAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Custom application AMI id produced from the builder instance.
+  LambdaArtifactKey:
+    Type: String
+    Default: artifacts/lambda/lambda.zip
+    Description: S3 key of the Lambda deployment package within the project bucket.
+  DbEngineVersion:
+    Type: String
+    Default: 8.0.46
+  DatabaseName:
+    Type: String
+    Default: nagp_documents
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,63}$'
+  ProjectName:
+    Type: String
+    Default: nagp
+  AsgMaxSize:
+    Type: Number
+    Default: 2
+    AllowedValues: [2, 4]
+    Description: >
+      Maximum app instances. Default 2 fits the account's 5-vCPU Standard EC2 quota
+      (2 x t3.micro = 4 vCPU). Set to 4 only after an EC2 vCPU quota increase.
+
+Resources:
+
+  # ---------------------------------------------------------------- Database
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mysql
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: '20'
+      StorageType: gp2
+      MultiAZ: false
+      PubliclyAccessible: false
+      StorageEncrypted: true
+      DeletionProtection: false
+      DeleteAutomatedBackups: true
+      BackupRetentionPeriod: 0
+      ManageMasterUserPassword: true
+      MasterUsername: nagpadmin
+      DBName: !Ref DatabaseName
+      DBSubnetGroupName:
+        Fn::ImportValue: !Sub '${FoundationStackName}-DbSubnetGroupName'
+      VPCSecurityGroups:
+        - Fn::ImportValue: !Sub '${FoundationStackName}-RdsSecurityGroupId'
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+  # ------------------------------------------------------------ Lambda IAM
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: 'sts:AssumeRole' }]
+      Policies:
+        - PolicyName: lambda-processor
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !GetAtt LambdaLogGroup.Arn
+              - Sid: ReadUploads
+                Effect: Allow
+                Action: ['s3:GetObject']
+                Resource:
+                  Fn::Sub:
+                    - '${BucketArn}/uploads/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${FoundationStackName}-ArtifactBucketArn'
+              - Sid: ReadDbSecret
+                Effect: Allow
+                Action: ['secretsmanager:GetSecretValue']
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+              - Sid: VpcEni
+                Effect: Allow
+                # ENI lifecycle for VPC-attached Lambda requires Resource '*' (AWS limitation).
+                Action:
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DeleteNetworkInterface'
+                Resource: '*'
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-doc-processor'
+      RetentionInDays: 7
+
+  UploadProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-doc-processor'
+      Runtime: python3.14
+      Handler: handler.lambda_handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket:
+          Fn::ImportValue: !Sub '${FoundationStackName}-ArtifactBucketName'
+        S3Key: !Ref LambdaArtifactKey
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${FoundationStackName}-LambdaSecurityGroupId'
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${FoundationStackName}-PrivateAppSubnetAId'
+          - Fn::ImportValue: !Sub '${FoundationStackName}-PrivateAppSubnetBId'
+      Environment:
+        Variables:
+          DB_SECRET_ARN: !GetAtt Database.MasterUserSecret.SecretArn
+          DB_HOST: !GetAtt Database.Endpoint.Address
+          DB_PORT: !Sub '${Database.Endpoint.Port}'
+          DB_NAME: !Ref DatabaseName
+          UPLOAD_PREFIX: uploads/
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+  # S3 (in the foundation stack) is granted invoke rights here, scoped to the project
+  # bucket and account. The foundation notification is wired via a later stack update.
+  UploadInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UploadProcessorFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn:
+        Fn::ImportValue: !Sub '${FoundationStackName}-ArtifactBucketArn'
+
+  # ------------------------------------------------------------------- ALB
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - Fn::ImportValue: !Sub '${FoundationStackName}-PublicSubnetAId'
+        - Fn::ImportValue: !Sub '${FoundationStackName}-PublicSubnetBId'
+      SecurityGroups:
+        - Fn::ImportValue: !Sub '${FoundationStackName}-AlbSecurityGroupId'
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub '${FoundationStackName}-VpcId'
+      Port: 8000
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: { HttpCode: '200' }
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
+
+  # -------------------------------------------------------- Launch template
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-app-lt'
+      LaunchTemplateData:
+        ImageId: !Ref AppAmiId
+        InstanceType: t3.micro
+        CreditSpecification: { CpuCredits: standard }
+        IamInstanceProfile:
+          Name:
+            Fn::ImportValue: !Sub '${FoundationStackName}-AppInstanceProfileName'
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${FoundationStackName}-AppSecurityGroupId'
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 8, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              umask 077
+              cat >/etc/nagp-app.env <<EOF
+              S3_BUCKET=${BucketName}
+              AWS_REGION=${AWS::Region}
+              UPLOAD_PREFIX=uploads/
+              MAX_UPLOAD_MB=10
+              EOF
+              chmod 600 /etc/nagp-app.env
+              # Explicit restart so the freshly written env file is loaded even if the
+              # pre-installed service already auto-started at boot without it.
+              systemctl daemon-reload
+              systemctl enable nagp-app.service
+              systemctl restart nagp-app.service
+              # Local readiness check (curl is present in the baked AMI).
+              for _ in $(seq 1 15); do
+                if curl -fsS http://127.0.0.1:8000/health >/dev/null; then break; fi
+                sleep 2
+              done
+              systemctl is-active --quiet nagp-app.service
+            - BucketName:
+                Fn::ImportValue: !Sub '${FoundationStackName}-ArtifactBucketName'
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub '${ProjectName}-app' }
+              - { Key: Project, Value: !Ref ProjectName }
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '2'
+      DesiredCapacity: '2'
+      MaxSize: !Ref AsgMaxSize
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub '${FoundationStackName}-PrivateAppSubnetAId'
+        - Fn::ImportValue: !Sub '${FoundationStackName}-PrivateAppSubnetBId'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics: [GroupDesiredCapacity, GroupInServiceInstances]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-app', PropagateAtLaunch: true }
+        - { Key: Project, Value: !Ref ProjectName, PropagateAtLaunch: true }
+
+  CpuTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 50
+
+  # -------------------------------------------------------- CloudWatch alarms
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref UploadProcessorFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-5xx'
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions: [{ Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-unhealthy-hosts'
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+        - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  AsgInServiceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-asg-in-service-low'
+      Namespace: AWS/AutoScaling
+      MetricName: GroupInServiceInstances
+      Dimensions: [{ Name: AutoScalingGroupName, Value: !Ref AutoScalingGroup }]
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 2
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+
+  RdsCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-cpu-high'
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  RdsConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-connections-high'
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-overview'
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              { "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+                "properties": { "title": "ALB requests / 5XX", "region": "${AWS::Region}", "view": "timeSeries",
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${AlbFull}", { "stat": "Sum" } ],
+                    [ "AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", "${AlbFull}", { "stat": "Sum" } ]
+                  ] } },
+              { "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+                "properties": { "title": "Target health", "region": "${AWS::Region}", "view": "timeSeries",
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TgFull}", "LoadBalancer", "${AlbFull}", { "stat": "Average" } ],
+                    [ "AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${TgFull}", "LoadBalancer", "${AlbFull}", { "stat": "Average" } ]
+                  ] } },
+              { "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+                "properties": { "title": "ASG capacity", "region": "${AWS::Region}", "view": "timeSeries",
+                  "metrics": [
+                    [ "AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${AsgName}" ],
+                    [ "AWS/AutoScaling", "GroupDesiredCapacity", "AutoScalingGroupName", "${AsgName}" ]
+                  ] } },
+              { "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+                "properties": { "title": "Lambda", "region": "${AWS::Region}", "view": "timeSeries",
+                  "metrics": [
+                    [ "AWS/Lambda", "Invocations", "FunctionName", "${FnName}", { "stat": "Sum" } ],
+                    [ "AWS/Lambda", "Errors", "FunctionName", "${FnName}", { "stat": "Sum" } ],
+                    [ "AWS/Lambda", "Duration", "FunctionName", "${FnName}", { "stat": "Average" } ]
+                  ] } },
+              { "type": "metric", "x": 0, "y": 12, "width": 24, "height": 6,
+                "properties": { "title": "RDS", "region": "${AWS::Region}", "view": "timeSeries",
+                  "metrics": [
+                    [ "AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${DbId}", { "stat": "Average" } ],
+                    [ "AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${DbId}", { "stat": "Average" } ],
+                    [ "AWS/RDS", "FreeStorageSpace", "DBInstanceIdentifier", "${DbId}", { "stat": "Average" } ]
+                  ] } }
+            ]
+          }
+        - AlbFull: !GetAtt Alb.LoadBalancerFullName
+          TgFull: !GetAtt TargetGroup.TargetGroupFullName
+          AsgName: !Ref AutoScalingGroup
+          FnName: !Ref UploadProcessorFunction
+          DbId: !Ref Database
+
+Outputs:
+  AlbDnsName:
+    Description: Public application URL host (HTTP).
+    Value: !GetAtt Alb.DNSName
+  UploadProcessorFunctionArn:
+    Description: Set this as the foundation UploadLambdaArn to wire the S3 notification.
+    Value: !GetAtt UploadProcessorFunction.Arn
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address

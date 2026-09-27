@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NAGP Insurance — Document Upload</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 1.5rem; }
+    .row { margin: 1rem 0; }
+    button { padding: 0.6rem 1.2rem; border: 0; border-radius: 8px; background: #0b5cad; color: #fff; font-size: 1rem; cursor: pointer; }
+    button:hover { background: #094a8c; }
+    .hint { color: #666; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <h1>Insurance Document Upload</h1>
+  <div class="card">
+    <form action="/upload" method="post" enctype="multipart/form-data">
+      <div class="row">
+        <input type="file" name="file" required />
+      </div>
+      <div class="row">
+        <button type="submit">Upload document</button>
+      </div>
+      <p class="hint">Maximum upload size: {{ max_mb }} MiB. Files are stored privately.</p>
+    </form>
+  </div>
+</body>
+</html>

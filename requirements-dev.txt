@@ -1,0 +1,8 @@
+# Local development / test dependencies (run in the project .venv).
+# Exact pins = the versions installed and tested locally (reproducible for this assignment).
+# No secrets, no environment-specific package indexes.
+Flask==3.1.3
+boto3==1.43.103
+PyMySQL==1.2.3
+pytest==8.4.2
+cfn-lint==1.57.0
